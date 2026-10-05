@@ -17,7 +17,12 @@ Typical use:
     x = normalize_roi(center_crop(roi, 256))
     t = to_torch(x)                                         # (N, C, H, W) tensor
 
-Requires numpy. matplotlib (previews), requests (Google Drive) and torch
+QC helpers (RGB brightfield stacks, white background):
+    st = section_stats(roi)                  # dict of per-section arrays: coverage, bbox, centroid, ...
+    flags = flag_sections(st)                # [(section, reason, value, (lo, hi)), ...]
+    d = adjacent_change(roi)                 # 1 - NCC between sections N and N+1 (len Z-1)
+
+Requires numpy (scipy for the QC helpers). matplotlib (previews), requests (Google Drive) and torch
 (to_torch) are imported only when those functions are used.
 """
 
@@ -39,6 +44,13 @@ __all__ = [
     "downsample_roi",
     "to_grayscale",
     "to_torch",
+    "to_od",
+    "tissue_mask",
+    "section_stats",
+    "local_zscore",
+    "flag_sections",
+    "lowres_stack",
+    "adjacent_change",
 ]
 
 
@@ -424,3 +436,155 @@ def to_torch(roi, channels_first=True, dtype=None):
         a = np.array(a)  # torch can't wrap read-only memory
     t = torch.from_numpy(a)  # works on strided views too
     return t if dtype is None else t.to(dtype)
+
+
+# --------------------------------------------------------------------------- #
+# QC / exploration helpers (numpy + scipy.ndimage only)
+# --------------------------------------------------------------------------- #
+_OD_LUT = (-np.log10((np.arange(256, dtype=np.float32) + 1.0) / 256.0)).astype(np.float32)
+
+
+def to_od(sec):
+    """Optical density of one uint8 section, summed over channels -> (H, W) float32.
+
+    White (255) maps to ~0. Uses a 256-entry lookup table, so it is much faster than log10 per pixel.
+    """
+    a = np.asarray(sec)
+    if a.dtype != np.uint8:
+        a = np.clip(a, 0, 255).astype(np.uint8)
+    od = _OD_LUT[a]
+    return od.sum(-1) if od.ndim == 3 else od
+
+
+def tissue_mask(sec, od_thr=0.03, sigma=1.0, min_frac=5e-4):
+    """Boolean tissue mask for one section: smoothed summed-OD > od_thr, components < min_frac of the FOV removed.
+
+    od_thr=0.03 sits just above the OD of clipped-white background (<= ~0.026), so it does not depend on
+    how dark the stain is (a fixed 'mean < 245' cut under-counts pale stains by 5-20 %).
+    """
+    from scipy import ndimage as ndi
+
+    od = to_od(sec)
+    if sigma:
+        od = ndi.gaussian_filter(od, sigma)
+    m = od > od_thr
+    lab, n = ndi.label(m)
+    if n:
+        keep = np.bincount(lab.ravel()) >= max(4, int(min_frac * m.size))
+        keep[0] = False
+        m = keep[lab]
+    return m
+
+
+def section_stats(roi, od_thr=0.03, sections=None):
+    """Per-section QC features -> dict of 1-D arrays (one entry per section; wrap in pandas.DataFrame if wanted).
+
+    Keys: section, coverage, fg_mean, fg_std (tissue luminance), n_comp, frag (share of tissue outside the largest
+    component), bbox_h, bbox_w, cy, cx (centroid, fraction of FOV), border (fraction of the image border that is tissue).
+    """
+    from scipy import ndimage as ndi
+
+    idx = range(len(roi)) if sections is None else sections
+    keys = ["coverage", "fg_mean", "fg_std", "n_comp", "frag", "bbox_h", "bbox_w", "cy", "cx", "border"]
+    out = {k: [] for k in keys}
+    out["section"] = list(idx)
+    for z in out["section"]:
+        s = np.asarray(roi[z])
+        m = tissue_mask(s, od_thr)
+        n = int(m.sum())
+        lum = s.mean(-1) if s.ndim == 3 else s
+        lab, nc = ndi.label(m)
+        areas = np.bincount(lab.ravel())[1:] if nc else np.zeros(1)
+        if n:
+            ys, xs = np.nonzero(m)
+            vals = (lum[m].mean(), lum[m].std(), ys.max() - ys.min() + 1, xs.max() - xs.min() + 1, ys.mean() / m.shape[0], xs.mean() / m.shape[1])
+        else:
+            vals = (np.nan,) * 6
+        ring = np.concatenate([m[0], m[-1], m[1:-1, 0], m[1:-1, -1]])
+        row = dict(coverage=n / m.size, fg_mean=vals[0], fg_std=vals[1], n_comp=nc, frag=1 - areas.max() / areas.sum() if nc else 0.0,
+                   bbox_h=vals[2], bbox_w=vals[3], cy=vals[4], cx=vals[5], border=float(ring.mean()))
+        for k in keys:
+            out[k].append(row[k])
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
+def local_zscore(v, window=7, floor_frac=0.02):
+    """Robust z of each value against a rolling-median expectation -> (z, expected, scale).
+
+    Right for series with a smooth trend along Z (tissue coverage is a dome, so a global z-score flags the
+    natural ends). scale = MAD of the residuals, floored at floor_frac * (P95 - P5) so flat series don't explode.
+    """
+    from scipy.ndimage import median_filter
+
+    v = np.asarray(v, dtype=float)
+    ok = np.isfinite(v)
+    ref = median_filter(np.where(ok, v, np.nanmedian(v)), size=window, mode="nearest")
+    res = v - ref
+    scale = max(1.4826 * np.nanmedian(np.abs(res - np.nanmedian(res))), floor_frac * (np.nanpercentile(v, 95) - np.nanpercentile(v, 5)), 1e-9)
+    return res / scale, ref, scale
+
+
+def flag_sections(stats, z_thr=4.0, blank=0.005, near_blank_rel=0.10, min_cov_change=0.02, frag_max=0.05, edge=5):
+    """Rule-based section QC on section_stats() output -> list of (section, reason, value, (expected_lo, expected_hi)).
+
+    Rules: blank (coverage < blank), nearly_blank (< near_blank_rel x P90 coverage), small/large_tissue (local z of
+    coverage > z_thr and >= min_cov_change away from expectation), fragmented (frag > frag_max). Contiguous low-coverage
+    runs at either end of the stack and the first/last `edge` sections are tagged 'series_end' instead of being
+    reported as defects (tissue physically enters/leaves the FOV there).
+    """
+    cov, sec = stats["coverage"], stats["section"]
+    z, ref, sc = local_zscore(cov)
+    plateau = np.percentile(cov, 90)
+    low = cov < near_blank_rel * plateau
+    end = np.zeros(len(cov), bool)
+    end[:edge] = end[-edge:] = True
+    for rng in (range(len(cov)), range(len(cov) - 1, -1, -1)):
+        for i in rng:
+            if not low[i]:
+                break
+            end[i] = True
+    out = []
+    for i, s in enumerate(sec):
+        tag = lambda r: ("series_end:" + r) if end[i] else r
+        lo, hi = ref[i] - z_thr * sc, ref[i] + z_thr * sc
+        if cov[i] < blank:
+            out.append((s, tag("blank"), cov[i], (blank, 1.0)))
+            continue
+        if low[i]:
+            out.append((s, tag("nearly_blank"), cov[i], (near_blank_rel * plateau, 1.0)))
+        elif abs(cov[i] - ref[i]) >= min_cov_change and abs(z[i]) > z_thr:
+            out.append((s, tag("small_tissue" if z[i] < 0 else "large_tissue"), cov[i], (lo, hi)))
+        if stats["frag"][i] > frag_max:
+            out.append((s, tag("fragmented"), stats["frag"][i], (0.0, frag_max)))
+    return out
+
+
+def lowres_stack(roi, size=64):
+    """OD map of every section resampled to (size, size) by block averaging -> (Z, size, size) float32.
+
+    Small, stain-agnostic (white = 0) representation for continuity checks and cross-stain comparison.
+    """
+    from scipy import ndimage as ndi
+
+    out = np.empty((len(roi), size, size), np.float32)
+    for z in range(len(roi)):
+        od = to_od(roi[z])
+        out[z] = ndi.zoom(ndi.uniform_filter(od, max(1, od.shape[0] // size)), (size / od.shape[0], size / od.shape[1]), order=1)
+    return out
+
+
+def adjacent_change(roi, size=64, lag=1):
+    """Structural change between sections N and N+lag: 1 - Pearson NCC of low-res OD maps -> (Z-lag,) array.
+
+    Blank-vs-blank = 0, blank-vs-content = 1. A single large value with small skip-distance d(N-1, N+1) means
+    section N is a bad section; a persistent jump means a real discontinuity in the series.
+    """
+    lo = lowres_stack(roi, size).reshape(len(roi), -1).astype(np.float64)
+    lo -= lo.mean(1, keepdims=True)
+    nrm = np.linalg.norm(lo, axis=1)
+    a, b = lo[:-lag], lo[lag:]
+    na, nb = nrm[:-lag], nrm[lag:]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ncc = (a * b).sum(1) / (na * nb)
+    ncc = np.where((na < 1e-9) & (nb < 1e-9), 1.0, np.where((na < 1e-9) | (nb < 1e-9), 0.0, ncc))
+    return 1.0 - ncc
