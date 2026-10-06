@@ -40,6 +40,7 @@ import numpy as np
 __all__ = [
     "load_roi",
     "load_and_preview_roi",
+    "get_sgbc_roi_id",
     "preview_sections",
     "get_sections",
     "roi_info",
@@ -178,10 +179,48 @@ def _download_drive(file_id, dest_path):
     return filename
 
 
-def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=True, return_meta=False):
+def get_sgbc_roi_id(timeout=20):
+    """Get the Drive ID of the ROI from the SGBC tab that opened this Colab notebook.
+
+    Asks the opener window (postMessage) and waits up to `timeout` seconds. If that is not possible
+    (not in Colab, notebook not opened from SGBC, no answer), it asks you to paste the ID instead.
+    """
+    answer = None
+    try:
+        from google.colab import output
+
+        print("⏳ Waiting for SGBC to send the ROI ID...")
+        answer = output.eval_js("""
+        new Promise((resolve, reject) => {
+            const listener = (event) => {
+                if (event.data && event.data.type === "SGBC_ROI_ID") {
+                    window.removeEventListener("message", listener);
+                    resolve(event.data.roi_id);
+                }
+            };
+            window.addEventListener("message", listener);
+            setTimeout(() => { window.removeEventListener("message", listener); reject(new Error("timeout")); }, %d);
+            if (window.top && window.top.opener) {
+                window.top.opener.postMessage({ type: "SGBC_REQUEST_ROI" }, "*");
+            } else {
+                reject(new Error("No window.opener"));
+            }
+        });
+        """ % int(timeout * 1000))
+    except Exception:  # not in Colab, no opener, timeout, ...
+        pass
+    if isinstance(answer, str) and answer.strip():
+        print("✅ Successfully received ROI ID.")
+        return answer.strip()
+    print("Could not get the ROI ID from SGBC automatically.")
+    return input("Paste the Google Drive file ID (ROI_DRIVE_ID): ").strip()
+
+
+def load_and_preview_roi(drive_id=None, custom_sections=None, mmap=False, preview=True, return_meta=False):
     """Download an ROI stack from Google Drive, print its info, and preview it.
 
-    drive_id         Google Drive file ID or share URL (file must be link-shared).
+    drive_id         Google Drive file ID or share URL (file must be link-shared). Omit it to receive the ID
+                     from the SGBC tab that opened this notebook (falls back to a paste prompt).
     custom_sections  list of section indices to preview (default: ~10 evenly spaced).
     mmap             keep the download on disk and memory-map it (huge stacks).
     preview          set False to skip the plot.
@@ -190,6 +229,8 @@ def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=Tru
 
     Returns the ROI as a NumPy array (or (roi, meta) with return_meta=True).
     """
+    if drive_id is None:
+        drive_id = get_sgbc_roi_id()
     m = re.search(r"[-\w]{25,}", drive_id)
     if not m:
         raise ValueError(f"Invalid Google Drive file ID or URL: '{drive_id}'")
