@@ -17,13 +17,18 @@ Typical use:
     x = normalize_roi(center_crop(roi, 256))
     t = to_torch(x)                                         # (N, C, H, W) tensor
 
-QC helpers (RGB brightfield stacks, white background):
-    st = section_stats(roi)                  # dict of per-section arrays: coverage, bbox, centroid, ...
-    flags = flag_sections(st)                # [(section, reason, value, (lo, hi)), ...]
-    d = adjacent_change(roi)                 # 1 - NCC between sections N and N+1 (len Z-1)
+QC for tissue-only (background-removed) stacks:
+    st = section_stats(roi)                  # per-section mean/std/percentiles/range/sharpness (+ background check)
+    flags = flag_sections(st)                # unusual values along Z: [(section, reason, value, (lo, hi)), ...]
+    an = find_section_anomalies(roi)         # isolated bad sections: dict with "section", "score", ...
+    rows = resolve_atlas_sections(an["section"], biosample_id=580, stain="NISL",
+                                  center_section=meta["center_section"], n_sections=len(roi))
+    preview_sections(roi, sections=an["section"], context=1)   # each bad section with its neighbours
 
-Requires numpy (scipy for the QC helpers). matplotlib (previews), requests (Google Drive) and torch
-(to_torch) are imported only when those functions are used.
+Fallback for sections that still contain background: tissue_mask(roi[i]) (optical-density based).
+
+Requires numpy (scipy for the QC helpers, requests for the Atlas lookup). matplotlib (previews), requests
+(Google Drive) and torch (to_torch) are imported only when those functions are used.
 """
 
 import os
@@ -51,6 +56,8 @@ __all__ = [
     "flag_sections",
     "lowres_stack",
     "adjacent_change",
+    "find_section_anomalies",
+    "resolve_atlas_sections",
 ]
 
 
@@ -171,15 +178,17 @@ def _download_drive(file_id, dest_path):
     return filename
 
 
-def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=True):
+def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=True, return_meta=False):
     """Download an ROI stack from Google Drive, print its info, and preview it.
 
     drive_id         Google Drive file ID or share URL (file must be link-shared).
     custom_sections  list of section indices to preview (default: ~10 evenly spaced).
     mmap             keep the download on disk and memory-map it (huge stacks).
     preview          set False to skip the plot.
+    return_meta      also return {"filename", "center_section", "stain"} parsed from the file name
+                     (center_section is the Atlas section the stack is centred on; see resolve_atlas_sections).
 
-    Returns the ROI as a NumPy array.
+    Returns the ROI as a NumPy array (or (roi, meta) with return_meta=True).
     """
     m = re.search(r"[-\w]{25,}", drive_id)
     if not m:
@@ -220,6 +229,10 @@ def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=Tru
             preview_sections(roi, sections=custom_sections)
         else:
             preview_sections(roi, sections=np.linspace(0, n - 1, min(10, n), dtype=int))
+    if return_meta:
+        se = re.search(r"(?:SE|se|sec|section(?:_number)?)[-_=]?(\d+)", re.sub(r"\.npy$", "", filename, flags=re.I))
+        return roi, {"filename": filename, "center_section": int(se.group(1)) if se else None,
+                     "stain": meta.get("Stain")}
     return roi
 
 
@@ -227,13 +240,14 @@ def load_and_preview_roi(drive_id, custom_sections=None, mmap=False, preview=Tru
 # Exploring
 # --------------------------------------------------------------------------- #
 def preview_sections(roi, start=None, end=None, step=1, sections=None,
-                     max_sections=30, ncols=5):
+                     max_sections=30, ncols=5, context=0):
     """Plot sections in a grid.
 
     preview_sections(roi, start=100, end=150)       sections 100..149 (end exclusive)
     preview_sections(roi, start=100, end=150, step=10)
     preview_sections(roi, sections=[10, 25, 80])    exactly these sections
     preview_sections(roi)                           ~10 evenly spaced sections
+    preview_sections(roi, sections=[54], context=1) section 54 plus 1 neighbour each side (54 in red)
 
     Long ranges are thinned to max_sections evenly spaced ones to keep plots fast.
     """
@@ -244,6 +258,9 @@ def preview_sections(roi, start=None, end=None, step=1, sections=None,
         idx = list(np.unique(np.linspace(0, n - 1, min(10, n), dtype=int)))
     else:
         idx = _select(n, start, end, step, sections)
+    marked = set(idx) if context else set()
+    if context:
+        idx = sorted({j for i in idx for j in range(i - context, i + context + 1) if 0 <= j < n})
     if len(idx) > max_sections:
         print(f"Showing {max_sections} of {len(idx)} sections "
               f"(raise max_sections or use step= to change).")
@@ -255,7 +272,7 @@ def preview_sections(roi, start=None, end=None, step=1, sections=None,
     axes = np.atleast_1d(axes).ravel()
     for ax, i in zip(axes, idx):
         _show(ax, roi[i] if roi.ndim >= 3 else roi)
-        ax.set_title(f"Section {i}", fontsize=10)
+        ax.set_title(f"Section {i}", fontsize=10, color="red" if i in marked else "black")
     for ax in axes:
         ax.axis("off")
     plt.tight_layout()
@@ -438,8 +455,14 @@ def to_torch(roi, channels_first=True, dtype=None):
     return t if dtype is None else t.to(dtype)
 
 
+
+
 # --------------------------------------------------------------------------- #
-# QC / exploration helpers (numpy + scipy.ndimage only)
+# QC helpers (numpy + scipy.ndimage only)
+#
+# Primary QC reads the pixels as they are: stacks are normally already
+# background-removed (tissue only), so no segmentation is run by default.
+# to_od() / tissue_mask() are a FALLBACK for sections with residual background.
 # --------------------------------------------------------------------------- #
 _OD_LUT = (-np.log10((np.arange(256, dtype=np.float32) + 1.0) / 256.0)).astype(np.float32)
 
@@ -457,10 +480,11 @@ def to_od(sec):
 
 
 def tissue_mask(sec, od_thr=0.03, sigma=1.0, min_frac=5e-4):
-    """Boolean tissue mask for one section: smoothed summed-OD > od_thr, components < min_frac of the FOV removed.
+    """FALLBACK background removal for one section with a white background -> boolean tissue mask.
 
-    od_thr=0.03 sits just above the OD of clipped-white background (<= ~0.026), so it does not depend on
-    how dark the stain is (a fixed 'mean < 245' cut under-counts pale stains by 5-20 %).
+    Smoothed summed-OD > od_thr, components < min_frac of the FOV removed. od_thr=0.03 sits just above the OD
+    of clipped-white background (<= ~0.026), so it does not depend on how dark the stain is. Only needed for
+    sections that still contain background; section_stats() calls it only for those.
     """
     from scipy import ndimage as ndi
 
@@ -476,43 +500,66 @@ def tissue_mask(sec, od_thr=0.03, sigma=1.0, min_frac=5e-4):
     return m
 
 
-def section_stats(roi, od_thr=0.03, sections=None):
-    """Per-section QC features -> dict of 1-D arrays (one entry per section; wrap in pandas.DataFrame if wanted).
+def _gray2d(sec):
+    a = np.asarray(sec, dtype=np.float32)
+    return a.mean(-1) if a.ndim == 3 else a
 
-    Keys: section, coverage, fg_mean, fg_std (tissue luminance), n_comp, frag (share of tissue outside the largest
-    component), bbox_h, bbox_w, cy, cx (centroid, fraction of FOV), border (fraction of the image border that is tissue).
+
+def _sharpness(g):
+    """Variance of the Laplacian: low = blurry / out of focus."""
+    if min(g.shape) < 3:
+        return 0.0
+    lap = 4 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]
+    return float(lap.var())
+
+
+def _white_level(roi):
+    """'Near-white' intensity for this dtype (0.96 of full scale)."""
+    if np.issubdtype(roi.dtype, np.integer):
+        return 0.96 * np.iinfo(roi.dtype).max
+    return 0.96 if float(np.max(roi[0])) <= 1.0 else 245.0
+
+
+def section_stats(roi, sections=None, bg_thr=0.05):
+    """Per-section QC features for tissue-only stacks -> dict of 1-D arrays (wrap in pandas.DataFrame if wanted).
+
+    Keys: section; mean, std, p1, p99, dynamic_range (p99 - p1), sharpness (variance of Laplacian);
+    white_frac / zero_frac (share of near-white / all-zero pixels = residual background check);
+    tissue_frac (1.0 when both are below bg_thr, i.e. no segmentation needed; otherwise measured with the
+    background-removal fallback, so it is only meaningful where background remains).
+    Works on (Z, H, W) or (Z, H, W, C); one section in memory at a time.
     """
-    from scipy import ndimage as ndi
-
-    idx = range(len(roi)) if sections is None else sections
-    keys = ["coverage", "fg_mean", "fg_std", "n_comp", "frag", "bbox_h", "bbox_w", "cy", "cx", "border"]
+    idx = list(range(_n_sections(roi))) if sections is None else [int(i) for i in np.atleast_1d(sections)]
+    white = _white_level(roi)
+    keys = ["mean", "std", "p1", "p99", "dynamic_range", "sharpness", "white_frac", "zero_frac", "tissue_frac"]
     out = {k: [] for k in keys}
-    out["section"] = list(idx)
-    for z in out["section"]:
+    for z in idx:
         s = np.asarray(roi[z])
-        m = tissue_mask(s, od_thr)
-        n = int(m.sum())
-        lum = s.mean(-1) if s.ndim == 3 else s
-        lab, nc = ndi.label(m)
-        areas = np.bincount(lab.ravel())[1:] if nc else np.zeros(1)
-        if n:
-            ys, xs = np.nonzero(m)
-            vals = (lum[m].mean(), lum[m].std(), ys.max() - ys.min() + 1, xs.max() - xs.min() + 1, ys.mean() / m.shape[0], xs.mean() / m.shape[1])
+        g = _gray2d(s)
+        sub = g.ravel()[::max(1, g.size // 250_000)]  # percentiles on a subsample
+        p1, p99 = np.percentile(sub, (1, 99))
+        wf = float((g >= white).mean())
+        zf = float((s == 0).all(-1).mean() if s.ndim == 3 else (s == 0).mean())
+        if max(wf, zf) < bg_thr:
+            tf = 1.0
+        elif zf >= wf:
+            tf = 1.0 - zf  # black background: non-zero = tissue
         else:
-            vals = (np.nan,) * 6
-        ring = np.concatenate([m[0], m[-1], m[1:-1, 0], m[1:-1, -1]])
-        row = dict(coverage=n / m.size, fg_mean=vals[0], fg_std=vals[1], n_comp=nc, frag=1 - areas.max() / areas.sum() if nc else 0.0,
-                   bbox_h=vals[2], bbox_w=vals[3], cy=vals[4], cx=vals[5], border=float(ring.mean()))
+            tf = float(tissue_mask(s * 255 if white < 1 else s).mean())
+        row = dict(mean=g.mean(dtype=np.float64), std=g.std(dtype=np.float64), p1=p1, p99=p99, dynamic_range=p99 - p1,
+                   sharpness=_sharpness(g), white_frac=wf, zero_frac=zf, tissue_frac=tf)
         for k in keys:
             out[k].append(row[k])
-    return {k: np.asarray(v) for k, v in out.items()}
+    res = {k: np.asarray(v, dtype=float) for k, v in out.items()}
+    res["section"] = np.asarray(idx)
+    return res
 
 
 def local_zscore(v, window=7, floor_frac=0.02):
     """Robust z of each value against a rolling-median expectation -> (z, expected, scale).
 
-    Right for series with a smooth trend along Z (tissue coverage is a dome, so a global z-score flags the
-    natural ends). scale = MAD of the residuals, floored at floor_frac * (P95 - P5) so flat series don't explode.
+    Right for series with a smooth trend along Z (a global z-score would flag the natural ends).
+    scale = MAD of the residuals, floored at floor_frac * (P95 - P5) so flat series don't explode.
     """
     from scipy.ndimage import median_filter
 
@@ -524,39 +571,27 @@ def local_zscore(v, window=7, floor_frac=0.02):
     return res / scale, ref, scale
 
 
-def flag_sections(stats, z_thr=4.0, blank=0.005, near_blank_rel=0.10, min_cov_change=0.02, frag_max=0.05, edge=5):
-    """Rule-based section QC on section_stats() output -> list of (section, reason, value, (expected_lo, expected_hi)).
+def flag_sections(stats, z_thr=4.0, window=7, min_rel=0.05, bg_thr=0.05,
+                  metrics=("mean", "std", "dynamic_range", "sharpness")):
+    """Flag sections whose QC values are unusual along Z -> list of (section, reason, value, (expected_lo, expected_hi)).
 
-    Rules: blank (coverage < blank), nearly_blank (< near_blank_rel x P90 coverage), small/large_tissue (local z of
-    coverage > z_thr and >= min_cov_change away from expectation), fragmented (frag > frag_max). Contiguous low-coverage
-    runs at either end of the stack and the first/last `edge` sections are tagged 'series_end' instead of being
-    reported as defects (tissue physically enters/leaves the FOV there).
+    Each metric in `metrics` is compared with its own rolling-median trend (local_zscore), so there are no global
+    thresholds; a deviation must also be >= min_rel of the expected value. Reasons look like 'sharpness_low'.
+    'residual_background' marks sections with a clearly larger white/zero share (> bg_thr) than their neighbours;
+    stack-wide background shows up directly in stats['white_frac'] / stats['zero_frac'].
     """
-    cov, sec = stats["coverage"], stats["section"]
-    z, ref, sc = local_zscore(cov)
-    plateau = np.percentile(cov, 90)
-    low = cov < near_blank_rel * plateau
-    end = np.zeros(len(cov), bool)
-    end[:edge] = end[-edge:] = True
-    for rng in (range(len(cov)), range(len(cov) - 1, -1, -1)):
-        for i in rng:
-            if not low[i]:
-                break
-            end[i] = True
-    out = []
-    for i, s in enumerate(sec):
-        tag = lambda r: ("series_end:" + r) if end[i] else r
-        lo, hi = ref[i] - z_thr * sc, ref[i] + z_thr * sc
-        if cov[i] < blank:
-            out.append((s, tag("blank"), cov[i], (blank, 1.0)))
-            continue
-        if low[i]:
-            out.append((s, tag("nearly_blank"), cov[i], (near_blank_rel * plateau, 1.0)))
-        elif abs(cov[i] - ref[i]) >= min_cov_change and abs(z[i]) > z_thr:
-            out.append((s, tag("small_tissue" if z[i] < 0 else "large_tissue"), cov[i], (lo, hi)))
-        if stats["frag"][i] > frag_max:
-            out.append((s, tag("fragmented"), stats["frag"][i], (0.0, frag_max)))
-    return out
+    sec, out = stats["section"], []
+    for k in metrics:
+        v = stats[k]
+        z, ref, sc = local_zscore(v, window)
+        bad = (np.abs(z) > z_thr) & (np.abs(v - ref) >= min_rel * np.abs(ref))
+        for i in np.flatnonzero(bad):
+            out.append((int(sec[i]), f"{k}_{'high' if z[i] > 0 else 'low'}", float(v[i]), (float(ref[i] - z_thr * sc), float(ref[i] + z_thr * sc))))
+    bg = np.maximum(stats["white_frac"], stats["zero_frac"])
+    _, bref, _ = local_zscore(bg, window)
+    for i in np.flatnonzero((bg > bg_thr) & (bg - bref > bg_thr / 2)):
+        out.append((int(sec[i]), "residual_background", float(bg[i]), (0.0, bg_thr)))
+    return sorted(out, key=lambda r: r[0])
 
 
 def lowres_stack(roi, size=64):
@@ -573,13 +608,14 @@ def lowres_stack(roi, size=64):
     return out
 
 
-def adjacent_change(roi, size=64, lag=1):
+def adjacent_change(roi, size=64, lag=1, lowres=None):
     """Structural change between sections N and N+lag: 1 - Pearson NCC of low-res OD maps -> (Z-lag,) array.
 
-    Blank-vs-blank = 0, blank-vs-content = 1. A single large value with small skip-distance d(N-1, N+1) means
-    section N is a bad section; a persistent jump means a real discontinuity in the series.
+    lag=1: normal neighbours; lag=2 (N-1 vs N+1) tells an isolated bad section from a real anatomical transition.
+    Blank-vs-blank = 0, blank-vs-content = 1. Pass lowres=lowres_stack(roi) to reuse it across several calls.
     """
-    lo = lowres_stack(roi, size).reshape(len(roi), -1).astype(np.float64)
+    lo = lowres_stack(roi, size) if lowres is None else lowres
+    lo = lo.reshape(len(lo), -1).astype(np.float64)
     lo -= lo.mean(1, keepdims=True)
     nrm = np.linalg.norm(lo, axis=1)
     a, b = lo[:-lag], lo[lag:]
@@ -588,3 +624,127 @@ def adjacent_change(roi, size=64, lag=1):
         ncc = (a * b).sum(1) / (na * nb)
     ncc = np.where((na < 1e-9) & (nb < 1e-9), 1.0, np.where((na < 1e-9) | (nb < 1e-9), 0.0, ncc))
     return 1.0 - ncc
+
+
+def find_section_anomalies(roi, size=64, z_thr=5.0, min_change=0.02, skip_ratio=0.5, lowres=None):
+    """Find isolated bad sections -> dict of arrays sorted by score: section, d_prev, d_next, d_skip, score.
+
+    Section N is suspicious when it differs from BOTH neighbours (d_prev = d1[N-1] and d_next = d1[N] are high:
+    above the stack's median change by z_thr robust SDs, and at least min_change) while the neighbours still
+    resemble each other (d_skip = d2[N-1] < skip_ratio * min(d_prev, d_next)). score = min(d_prev, d_next) - d_skip.
+    The first and last section have one neighbour and are not tested; two adjacent bad sections are not caught.
+    Returned `section` values are stack indices (use resolve_atlas_sections for Atlas numbers).
+    """
+    lo = lowres_stack(roi, size) if lowres is None else lowres
+    keys = ("section", "d_prev", "d_next", "d_skip", "score")
+    if len(lo) < 3:
+        return {k: np.empty(0) for k in keys}
+    d1 = adjacent_change(None, lag=1, lowres=lo)
+    d2 = adjacent_change(None, lag=2, lowres=lo)
+    med = np.median(d1)
+    hi = med + max(z_thr * 1.4826 * np.median(np.abs(d1 - med)), min_change)
+    prev_, next_ = d1[:-1], d1[1:]  # entry k describes section N = k + 1
+    both = np.minimum(prev_, next_)
+    hit = np.flatnonzero((prev_ > hi) & (next_ > hi) & (d2 < skip_ratio * both))
+    order = hit[np.argsort(-(both[hit] - d2[hit]))]
+    return {"section": order + 1, "d_prev": prev_[order], "d_next": next_[order], "d_skip": d2[order],
+            "score": both[order] - d2[order]}
+
+
+# --------------------------------------------------------------------------- #
+# Atlas section numbers
+# --------------------------------------------------------------------------- #
+# Sections endpoint used by resolve_atlas_sections(). Change it here for production; its query string
+# (biosample_id, stain) supplies the defaults when those arguments are omitted.
+ATLAS_SECTIONS_URL = "http://172.20.23.183:8054/sections?biosample_id=580&stain=NISL"
+
+
+def _section_number(rec, field=None):
+    """Atlas section number from one /sections entry (a bare number, or a dict holding one)."""
+    if isinstance(rec, (int, np.integer)) or (isinstance(rec, str) and rec.strip().isdigit()):
+        return int(rec)
+    if isinstance(rec, dict):
+        for k in ((field,) if field else ("section", "section_number", "sectionNumber", "section_id", "se", "number", "id")):
+            if k in rec:
+                return int(rec[k])
+        raise RuntimeError(f"Can't find the section number in record {rec}; pass section_field=<key>.")
+    raise RuntimeError(f"Unexpected /sections entry: {rec!r}")
+
+
+def _window_start(n_total, pos, n):
+    """Start position of an n-section stack centred on list position pos (window clamped at the list ends)."""
+    for z in range(n):
+        start, end = max(0, pos - z), min(n_total, pos + z + 1)
+        if end - start == n:
+            return start
+    raise ValueError(f"A stack of {n} sections can't come from a list of {n_total} sections.")
+
+
+def resolve_atlas_sections(stack_indices, biosample_id=None, stain=None, center_section=None, n_sections=None,
+                           first_section=None, api_url=None, section_field=None, timeout=10, verbose=True):
+    """Map ROI-stack indices to Atlas section numbers with ONE request to the /sections endpoint.
+
+    stack_indices   any list/array of indices into the stack (e.g. anomalies["section"]).
+    biosample_id, stain   passed to the endpoint; default to the ones in ATLAS_SECTIONS_URL (580, "NISL").
+    The stack is a contiguous window of the endpoint's ordered section list, so say where it starts with EITHER
+      first_section   Atlas section number of stack index 0, or
+      center_section + n_sections   the SE number in the file name (load_and_preview_roi(..., return_meta=True))
+                      and len(roi); the window is centred on the nearest listed section.
+    api_url         override ATLAS_SECTIONS_URL for one call, e.g. "http://host:8054" or a full /sections URL.
+    section_field   key holding the number if the endpoint returns dict records instead of plain numbers.
+
+    Returns a list of dicts: stack_index, biosample_id, stain, atlas_section, record (the API's own entry).
+    Out-of-range indices give atlas_section=None. Raises RuntimeError if the API can't be reached or read.
+    """
+    import requests
+    from urllib.parse import parse_qsl, urlsplit
+
+    parts = urlsplit(api_url or ATLAS_SECTIONS_URL)
+    params = dict(parse_qsl(parts.query))
+    if biosample_id is not None:
+        params["biosample_id"] = biosample_id
+    if stain:
+        params["stain"] = stain
+    biosample_id, stain = params.get("biosample_id"), params.get("stain")
+    if first_section is None and center_section is None:
+        raise ValueError("Say where the stack starts: first_section=<Atlas section of index 0>, or "
+                         "center_section=<SE number> with n_sections=len(roi).")
+    url = f"{parts.scheme}://{parts.netloc}{parts.path.rstrip('/')}"
+    url = url if url.endswith("/sections") else url + "/sections"
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError(f"Could not read sections from {url}: {e}") from None
+    if isinstance(data, dict):  # {"sections": [...]}, or any single list inside a dict
+        lists = [v for v in data.values() if isinstance(v, list)]
+        data = data["sections"] if isinstance(data.get("sections"), list) else (lists[0] if len(lists) == 1 else None)
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"Unexpected or empty /sections response from {url}.")
+    nums = np.array([_section_number(rec, section_field) for rec in data])  # API order is kept
+
+    if first_section is not None:
+        hits = np.flatnonzero(nums == int(first_section))
+        if not len(hits):
+            raise ValueError(f"first_section={first_section} is not in the section list for this biosample/stain.")
+        p0 = int(hits[0])
+    else:
+        if n_sections is None:
+            raise ValueError("center_section needs n_sections=len(roi).")
+        p0 = _window_start(len(nums), int(np.abs(nums - int(center_section)).argmin()), int(n_sections))
+
+    rows, bad = [], []
+    for i in (int(i) for i in np.atleast_1d(stack_indices)):
+        ok = 0 <= i < len(nums) - p0 and (n_sections is None or i < n_sections)
+        if not ok:
+            bad.append(i)
+        rows.append({"stack_index": i, "biosample_id": biosample_id, "stain": stain,
+                     "atlas_section": int(nums[p0 + i]) if ok else None, "record": data[p0 + i] if ok else None})
+    if verbose and rows:
+        print(f"{'stack_index':<12}| {'biosample_id':<13}| {'stain':<6}| atlas_section")
+        for r_ in rows:
+            print(f"{r_['stack_index']:<12}| {str(r_['biosample_id']):<13}| {str(r_['stain'] or '-'):<6}| {r_['atlas_section']}")
+    if bad:
+        print(f"Warning: stack indices outside this stack were not resolved: {bad}")
+    return rows
