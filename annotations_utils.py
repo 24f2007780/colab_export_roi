@@ -30,14 +30,13 @@ Stroke JSON ("registered" / OpenAtlas space), observed in the real GFAP/313/IHCS
   * Y is NEGATIVE (-143764 ... -56148): the registered space is Y-up with the origin at the top of the section,
     so image rows grow with -Y. The registered Y axis is therefore inverted relative to image rows:
         row_in_section = -Y        (y_sign = -1)
-  * The values are NOT pixels of the ROI and not even of the extractor's full-resolution grid: they reach
-    x ~ 170,000 while that grid (legacy level 0 of the zarr store, checked on biosample 585 IHCS) is 24,000 px wide.
-    Only 8 registered units per full-resolution pixel makes the data fit on both axes
-    (x -> 480..21,200 px, |y| -> 7,000..18,000 px; 1:1 or 4:1 would overflow, 16:1 would leave the tissue in the
-    left 44% of the section). That factor is DEFAULT_UNITS_PER_FULLRES_PX = 8 and is INFERRED, not published by
-    the API: confirm it on one landmark (annotation_bounds() prints the implied pixel extent) and override with
-    units_per_fullres_px= if your section grid differs. No section image for biosample 313 was reachable when
-    this was written, so the factor could not be checked against pixels.
+  * The values are NOT pixels of the ROI nor of the extractor's full-resolution grid: they are level-0 pixels of
+    the section TIFF. VERIFIED on 313/IHCS/1271: the IIP server reports Max-size 192000 x 192000 for
+    .../stroke2d/storageIIT/580/IHCS/B_580_HB2CV[LM][Fib]-SL_424-ST_IHCS-SE_1271_lossless.tif, and drawing the Fib
+    polygons on that image at (X, -Y) / 192000 puts them exactly on the lesions seen in the production viewer. The
+    extractor's full-resolution grid is the same image / 8 (24000 px), hence exactly 8 registered units per
+    full-res pixel (DEFAULT_UNITS_PER_FULLRES_PX) and NO translation (DEFAULT_OFFSET_XY = (0, 0)); rotation is 0.
+    (Compare overlays only against the SAME section: a neighbouring section's tissue differs and looks like an offset.)
 
 ROI side (taken from the ROI extractor, roi_extraction/apps/src/main.py):
   * center_X / center_Y (file name: X<..>_Y<..>) are on the extractor's FULL-RESOLUTION grid, +X right, +Y DOWN,
@@ -50,9 +49,9 @@ ROI side (taken from the ROI extractor, roi_extraction/apps/src/main.py):
     ROI. This is detected when the ROI is smaller than the size in the file name (a warning is raised); give
     origin_xy=(x0, y0) (level pixels of ROI pixel (0, 0)) to fix it.
 
-Full transform (all in float):
-    col = X / (units_per_fullres_px * level_factor) - x0
-    row = (-Y) / (units_per_fullres_px * level_factor) - y0
+Full transform (all in float), upp = units_per_fullres_px * level_factor:
+    col = (X - ox) / upp - x0
+    row = (-Y - oy) / upp - y0
 
 Requires numpy, requests, shapely (clipping), Pillow (masks/overlays); matplotlib only for preview_annotations.
 Atlas section numbers come from roi_utils.resolve_atlas_sections (roi_utils.py must be importable).
@@ -69,7 +68,10 @@ import numpy as np
 __all__ = [
     "STROKE_PROTEINS",
     "STROKE_API_BASE",
+    "ATLAS_BIOSAMPLE_MAP",
+    "stroke_biosample_id",
     "DEFAULT_UNITS_PER_FULLRES_PX",
+    "DEFAULT_OFFSET_XY",
     "StrokeAnnotationError",
     "RoiTransform",
     "RoiAnnotations",
@@ -78,6 +80,7 @@ __all__ = [
     "make_roi_transform",
     "to_roi_coordinates",
     "load_roi_annotations",
+    "find_stack_index",
     "annotation_bounds",
     "create_annotation_masks",
     "create_annotation_overlay",
@@ -90,7 +93,7 @@ STROKE_API_BASE = "https://c-stroke.humanbrain.in/histology_detections/openAtlas
 STROKE_PROTEINS = {
     "CD68": "Microglial density (CD68+)",
     "GFAP": "Astrocyte density (GFAP+)",
-    "Fib": "BBB disruption (Fib+)",
+    "FIB": "BBB disruption (Fib+)",
     "CD34": "Vessel density (CD34+)",
     "HIF1a": "Hypoxic regions (HIF1a+)",
     "Nissl": "Cell density (Nissl+)",
@@ -99,11 +102,18 @@ STROKE_PROTEINS = {
     "GAP43": "Axonal regrowth (GAP43+)",
 }
 
-# Registered-coordinate units per full-resolution ROI-extractor pixel. INFERRED (see module docstring): verify it.
+# Registered coordinates are level-0 pixels of the 192000 x 192000 TIFF; the extractor's full-resolution grid is that
+# image / 8 (24000 px), so 8 registered units = 1 full-res px. No translation (see module docstring).
 DEFAULT_UNITS_PER_FULLRES_PX = 8.0
+DEFAULT_OFFSET_XY = (0.0, 0.0)         # registered units: col = (X - ox) / upp,  row = (-Y - oy) / upp
+
+# Atlas (ROI image) biosample -> Stroke annotation biosample. Either id is accepted wherever `biosample_id` is taken.
+ATLAS_BIOSAMPLE_MAP = {580: 313, 584: 314, 585: 315, 586: 217, 587: 218}
+DEFAULT_ATLAS_BIOSAMPLE = 580
+_STROKE_TO_ATLAS = {v: k for k, v in ATLAS_BIOSAMPLE_MAP.items()}
 
 _COLORS = {
-    "CD68": "#D55E00", "GFAP": "#009E73", "Fib": "#CC79A7", "CD34": "#0072B2", "HIF1a": "#F0E442",
+    "CD68": "#D55E00", "GFAP": "#009E73", "FIB": "#CC79A7", "CD34": "#0072B2", "HIF1a": "#F0E442",
     "Nissl": "#56B4E9", "H&E": "#7F7F7F", "APP": "#8E44AD", "GAP43": "#FF7F00",
 }
 
@@ -134,10 +144,22 @@ def _check_proteins(proteins):
     return out
 
 
+def stroke_biosample_id(biosample_id):
+    """Stroke biosample for an Atlas biosample (580 -> 313, ...); Stroke ids (313, ...) pass through unchanged."""
+    b = int(biosample_id)
+    return ATLAS_BIOSAMPLE_MAP.get(b, b)
+
+
 def stroke_url(biosample_id, stain, section_num, protein, api_base=STROKE_API_BASE):
     """URL of one annotation file (the protein is percent-encoded, e.g. 'H&E' -> 'H%26E')."""
     return (f"{api_base.rstrip('/')}/{quote(protein, safe='')}/{biosample_id}/{stain}/{section_num}/"
             f"B-{biosample_id}_SE-{section_num}_registered.json")
+
+
+def _probe_protein(session, biosample_id, stain, section_num, protein, api_base, timeout):
+    """-> (url, probe result) for one protein; the STROKE_PROTEINS key is the exact (case-sensitive) URL spelling."""
+    url = stroke_url(biosample_id, stain, section_num, protein, api_base)
+    return url, _probe(session, url, timeout)
 
 
 def _session(workers):
@@ -233,13 +255,14 @@ def find_available_annotations(biosample_id, stain, section_num, proteins=None, 
     `available` is True only for a real JSON annotation. A missing annotation (HTTP 404, or the server's HTML
     fallback page) is simply available=False with error=None; real HTTP/network problems fill `error` (and warn).
     Wrap it in pandas.DataFrame(...) to display it. verbose=True also prints a table.
+    biosample_id may be the Stroke id (313) or the Atlas id (580), see ATLAS_BIOSAMPLE_MAP.
     """
     plist = _check_proteins(proteins)
-    urls = {p: stroke_url(biosample_id, stain, section_num, p, api_base) for p in plist}
-    with _session(workers) as s:
-        res = _probe_many(s, urls.values(), timeout, workers)
-    rows = [{"protein": p, "description": STROKE_PROTEINS[p], "available": res[urls[p]]["available"],
-             "url": urls[p], "status": res[urls[p]]["status"], "error": res[urls[p]]["error"]} for p in plist]
+    biosample_id = stroke_biosample_id(biosample_id)
+    with _session(workers) as s, ThreadPoolExecutor(max_workers=max(1, min(workers, len(plist)))) as ex:
+        got = list(ex.map(lambda p: _probe_protein(s, biosample_id, stain, section_num, p, api_base, timeout), plist))
+    rows = [{"protein": p, "description": STROKE_PROTEINS[p], "available": r["available"],
+             "url": u, "status": r["status"], "error": r["error"]} for p, (u, r) in zip(plist, got)]
     _warn_errors(rows)
     if verbose:
         print(f"{'protein':<8}| {'description':<27}| {'available':<10}| url")
@@ -290,6 +313,7 @@ def load_stroke_annotations(biosample_id, stain, section_num, proteins=None, api
     collection_rotation, roi_geometry (None until to_roi_coordinates()).
     """
     plist = _check_proteins(proteins)
+    biosample_id = stroke_biosample_id(biosample_id)
     avail = find_available_annotations(biosample_id, stain, section_num, plist, api_base, workers=workers)
     missing = [r["protein"] for r in avail if not r["available"] and not r["error"]]
     if proteins is not None and missing:
@@ -312,8 +336,8 @@ def load_stroke_annotations(biosample_id, stain, section_num, proteins=None, api
 class RoiTransform:
     """Registered (OpenAtlas) -> ROI pixel transform. See the module docstring for the convention.
 
-    col = X / units_per_px - x0 ;  row = y_sign * Y / units_per_px - y0
-    with units_per_px = units_per_fullres_px * level_factor.
+    col = (X - offset_x) / units_per_px - x0 ;  row = (y_sign * Y - offset_y) / units_per_px - y0
+    with units_per_px = units_per_fullres_px * level_factor. offset_x/offset_y are in registered units.
     """
     units_per_px: float
     x0: float
@@ -324,19 +348,22 @@ class RoiTransform:
     units_per_fullres_px: float = DEFAULT_UNITS_PER_FULLRES_PX
     level_factor: float = 1.0
     center_xy: tuple = None
+    offset_x: float = DEFAULT_OFFSET_XY[0]
+    offset_y: float = DEFAULT_OFFSET_XY[1]
 
     def apply(self, xy):
         """(N, 2) registered coordinates -> (N, 2) ROI (col, row) coordinates, as a new array."""
         a = np.asarray(xy, dtype=float)
         out = np.empty_like(a[:, :2])
-        out[:, 0] = a[:, 0] / self.units_per_px - self.x0
-        out[:, 1] = (self.y_sign * a[:, 1]) / self.units_per_px - self.y0
+        out[:, 0] = (a[:, 0] - self.offset_x) / self.units_per_px - self.x0
+        out[:, 1] = (self.y_sign * a[:, 1] - self.offset_y) / self.units_per_px - self.y0
         return out
 
     def describe(self):
         return (f"ROI {self.width}x{self.height}px, origin (level px) = ({self.x0:g}, {self.y0:g}), "
                 f"level_factor={self.level_factor:g}, {self.units_per_fullres_px:g} registered units per full-res px "
-                f"-> {self.units_per_px:g} units per ROI px, y_sign={self.y_sign}")
+                f"-> {self.units_per_px:g} units per ROI px, offset=({self.offset_x:g}, {self.offset_y:g}) units, "
+                f"y_sign={self.y_sign}")
 
 
 def _meta_get(meta, keys):
@@ -347,7 +374,7 @@ def _meta_get(meta, keys):
 
 
 def make_roi_transform(roi, meta=None, units_per_fullres_px=DEFAULT_UNITS_PER_FULLRES_PX, y_sign=-1,
-                       level_factor=None, center_xy=None, origin_xy=None, size=None):
+                       level_factor=None, center_xy=None, origin_xy=None, size=None, offset_xy=None):
     """Build the RoiTransform for an ROI stack from its metadata.
 
     center_X / center_Y are taken from meta ("center_X"/"center_Y", "Center X"/"Center Y"), else parsed from
@@ -357,6 +384,10 @@ def make_roi_transform(roi, meta=None, units_per_fullres_px=DEFAULT_UNITS_PER_FU
       origin_xy       (x0, y0): level-pixel position of ROI pixel (0, 0); skips the centre-based estimate (use it
                       for ROIs clamped at the section edge).
       size            requested ROI size, only used to detect clamping.
+      offset_xy       (ox, oy) registered-space translation (default DEFAULT_OFFSET_XY).
+    A ROI smaller than the requested size covers the whole section on that axis (the extractor then starts the window
+    at 0), so its origin is exactly 0 there; a window merely shifted at an edge cannot be detected (warning on mismatch
+    only when the origin is unknown).
     """
     meta = meta or {}
     fname = str(meta.get("filename") or "")
@@ -385,19 +416,21 @@ def make_roi_transform(roi, meta=None, units_per_fullres_px=DEFAULT_UNITS_PER_FU
         size = (int(m.group(1)), int(m.group(2))) if m else None
 
     if origin_xy is None:
-        if center_xy is None:
-            raise ValueError("Could not find center_X/center_Y in meta (or its filename). "
-                             "Pass center_xy=(X, Y) or origin_xy=(x0, y0).")
-        cxl, cyl = int(center_xy[0] / level_factor), int(center_xy[1] / level_factor)  # truncation as in the extractor
-        origin_xy = (cxl - W // 2, cyl - H // 2)
-        if size is not None and (W, H) != tuple(size):
-            warnings.warn(f"ROI is {W}x{H} but was requested as {size[0]}x{size[1]}: the window was clamped at the "
-                          f"section edge, so its origin cannot be recovered from the centre. Pass origin_xy=(x0, y0).",
-                          stacklevel=2)
+        W_req, H_req = size if size is not None else (W, H)
+        if W < W_req and H < H_req:           # whole section on both axes: window starts at 0 (extractor _window)
+            origin_xy = (0, 0)
+        else:
+            if center_xy is None:
+                raise ValueError("Could not find center_X/center_Y in meta (or its filename). "
+                                 "Pass center_xy=(X, Y) or origin_xy=(x0, y0).")
+            cxl, cyl = int(center_xy[0] / level_factor), int(center_xy[1] / level_factor)  # truncation as extractor
+            origin_xy = (0 if W < W_req else cxl - W // 2, 0 if H < H_req else cyl - H // 2)
     return RoiTransform(units_per_px=float(units_per_fullres_px) * float(level_factor), x0=float(origin_xy[0]),
                         y0=float(origin_xy[1]), width=int(W), height=int(H), y_sign=int(y_sign),
                         units_per_fullres_px=float(units_per_fullres_px), level_factor=float(level_factor),
-                        center_xy=tuple(center_xy) if center_xy is not None else None)
+                        center_xy=tuple(center_xy) if center_xy is not None else None,
+                        offset_x=float((offset_xy or DEFAULT_OFFSET_XY)[0]),
+                        offset_y=float((offset_xy or DEFAULT_OFFSET_XY)[1]))
 
 
 def _make_valid(poly):
@@ -517,18 +550,61 @@ class RoiAnnotations(dict):
         return [r for i in idx for p, rs in self.get(i, {}).items() if want is None or p in want for r in rs]
 
 
-def load_roi_annotations(roi, meta, biosample_id, proteins=None, api_base=STROKE_API_BASE, stain=None,
-                         section_indices=None, atlas_sections=None, atlas_api_url=None, timeout=60, workers=12,
-                         verbose=True, **transform_kwargs):
+def _atlas_sections(roi, meta, idxs, atlas_sections, atlas_biosample_id, atlas_stain, atlas_api_url):
+    """{stack_index: Atlas section number}: explicit atlas_sections, else roi_utils.resolve_atlas_sections."""
+    if atlas_sections is not None:
+        amap = dict(enumerate(atlas_sections)) if not isinstance(atlas_sections, dict) else dict(atlas_sections)
+        missing = [i for i in idxs if i not in amap]
+        if missing:
+            raise ValueError(f"atlas_sections has no entry for stack indices {missing}.")
+        return {i: int(amap[i]) for i in idxs}
+    from roi_utils import resolve_atlas_sections
+
+    rows = resolve_atlas_sections(idxs, biosample_id=atlas_biosample_id, stain=atlas_stain or (meta or {}).get("stain"),
+                                  center_section=(meta or {}).get("center_section"), n_sections=roi.shape[0],
+                                  api_url=atlas_api_url, verbose=False)
+    return {r["stack_index"]: r["atlas_section"] for r in rows if r["atlas_section"] is not None}
+
+
+def find_stack_index(roi, meta, section_num, biosample_id=None, atlas_sections=None, atlas_biosample_id=None,
+                     atlas_stain=None, atlas_api_url=None):
+    """Stack index of Atlas section `section_num` in this ROI stack (never assumes index == section number).
+
+    Use it to preview the stack section that really is the annotated section:
+        preview_annotations(roi, annotations_in_roi, section_index=find_stack_index(roi, meta, 1271))
+    Raises ValueError if the stack does not contain that section (annotations of another section would be drawn on
+    the wrong tissue). biosample_id (Stroke or Atlas id) only selects the Atlas biosample for the lookup.
+    """
+    if atlas_biosample_id is None and biosample_id is not None:
+        b = int(biosample_id)
+        atlas_biosample_id = b if b in ATLAS_BIOSAMPLE_MAP else _STROKE_TO_ATLAS.get(b)
+    amap = _atlas_sections(roi, meta, list(range(roi.shape[0])), atlas_sections, atlas_biosample_id, atlas_stain,
+                           atlas_api_url)
+    hits = [i for i, n in amap.items() if n == int(section_num)]
+    if not hits:
+        have = sorted(amap.values())
+        raise ValueError(f"Atlas section {section_num} is not in this ROI stack (it covers sections "
+                         f"{have[0]}..{have[-1]}); load an ROI centred on it.")
+    return hits[0]
+
+
+def load_roi_annotations(roi, meta, biosample_id=None, proteins=None, api_base=STROKE_API_BASE, stain=None,
+                         section_indices=None, atlas_sections=None, atlas_biosample_id=None, atlas_stain=None,
+                         atlas_api_url=None, timeout=60, workers=12, verbose=True, **transform_kwargs):
     """Annotations for every section of an ROI stack, transformed to ROI pixels and clipped to the ROI.
 
     Steps: stack index -> Atlas section (roi_utils.resolve_atlas_sections, never assumed equal) -> availability per
     protein (headers only) -> download only what exists -> registered -> ROI coordinates -> clip. `roi` is not modified.
 
     roi, meta       stack and the dict from load_and_preview_roi(..., return_meta=True).
-    biosample_id    Stroke biosample (e.g. 313).
+    biosample_id    Stroke biosample (313) or the equivalent Atlas biosample (580), see ATLAS_BIOSAMPLE_MAP;
+                    default DEFAULT_ATLAS_BIOSAMPLE (580 -> 313).
     proteins        subset of STROKE_PROTEINS (default: whatever exists, per section).
-    stain           default meta["stain"].
+    stain           stain in the Stroke URL (default meta["stain"]).
+    atlas_biosample_id, atlas_stain
+                    biosample/stain for the Atlas /sections lookup that maps stack index -> section number. These are
+                    those of the ROI's own images, NOT the Stroke biosample: default = the Atlas biosample that belongs to
+                    biosample_id (313 -> 580), and the ROI's stain (meta["stain"]).
     section_indices stack indices to load (default: all).
     atlas_sections  explicit {stack_index: Atlas section} or list (one per stack index), used INSTEAD of the
                     /sections lookup (e.g. when that endpoint does not know the biosample).
@@ -538,6 +614,10 @@ def load_roi_annotations(roi, meta, biosample_id, proteins=None, api_base=STROKE
     each with `geometry` (registered, untouched) and `roi_geometry` (ROI pixels, clipped).
     """
     n = roi.shape[0]
+    biosample_id = DEFAULT_ATLAS_BIOSAMPLE if biosample_id is None else int(biosample_id)
+    if atlas_biosample_id is None:
+        atlas_biosample_id = biosample_id if biosample_id in ATLAS_BIOSAMPLE_MAP else _STROKE_TO_ATLAS.get(biosample_id)
+    biosample_id = stroke_biosample_id(biosample_id)
     stain = stain or (meta or {}).get("stain")
     if not stain:
         raise ValueError("No stain: pass stain='IHCS' (meta['stain'] is empty).")
@@ -549,28 +629,18 @@ def load_roi_annotations(roi, meta, biosample_id, proteins=None, api_base=STROKE
     T = make_roi_transform(roi, meta, **transform_kwargs)
 
     # 1. stack index -> Atlas section
-    if atlas_sections is not None:
-        amap = dict(enumerate(atlas_sections)) if not isinstance(atlas_sections, dict) else dict(atlas_sections)
-        missing = [i for i in idxs if i not in amap]
-        if missing:
-            raise ValueError(f"atlas_sections has no entry for stack indices {missing}.")
-        atlas = {i: int(amap[i]) for i in idxs}
-    else:
-        from roi_utils import resolve_atlas_sections
-
-        rows = resolve_atlas_sections(idxs, biosample_id=biosample_id, stain=stain,
-                                      center_section=(meta or {}).get("center_section"), n_sections=n,
-                                      api_url=atlas_api_url, verbose=False)
-        atlas = {r["stack_index"]: r["atlas_section"] for r in rows if r["atlas_section"] is not None}
+    atlas = _atlas_sections(roi, meta, idxs, atlas_sections, atlas_biosample_id, atlas_stain, atlas_api_url)
 
     # 2. availability for every (section, protein), in parallel; geometry is not touched yet
-    urls = {(i, p): stroke_url(biosample_id, stain, atlas[i], p, api_base) for i in atlas for p in plist}
+    keys = [(i, p) for i in atlas for p in plist]
     with _session(workers) as s:
-        probes = _probe_many(s, urls.values(), min(timeout, 30), workers)
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys) or 1))) as ex:
+            probes = dict(zip(keys, ex.map(lambda k: _probe_protein(s, biosample_id, stain, atlas[k[0]], k[1],
+                                                                    api_base, min(timeout, 30)), keys)))
         availability = {i: [{"protein": p, "description": STROKE_PROTEINS[p], "stack_index": i,
-                             "atlas_section": atlas[i], "available": probes[urls[i, p]]["available"],
-                             "url": urls[i, p], "status": probes[urls[i, p]]["status"],
-                             "error": probes[urls[i, p]]["error"]} for p in plist] for i in atlas}
+                             "atlas_section": atlas[i], "available": probes[i, p][1]["available"],
+                             "url": probes[i, p][0], "status": probes[i, p][1]["status"],
+                             "error": probes[i, p][1]["error"]} for p in plist] for i in atlas}
         _warn_errors([r for rows_ in availability.values() for r in rows_])
 
         # 3. download only what exists (each file once)
@@ -689,11 +759,11 @@ def create_annotation_masks(roi, annotations, section_index, proteins=None):
 
 
 def create_annotation_overlay(roi, annotations, section_index, proteins=None, alpha=0.4, outline=True,
-                              color_by="protein"):
+                              color_by="feature"):
     """Section `section_index` with the annotation polygons blended on top -> NEW (H, W, 3) uint8 array.
 
-    color_by="protein" (one colour per protein) or "feature" (each polygon's own color_hex_triplet from its
-    GeoJSON properties, falling back to the protein colour). `roi` is not modified.
+    color_by="feature" (default: each polygon's own color_hex_triplet from its GeoJSON properties, falling back to the
+    protein colour) or "protein" (one fixed colour per protein). `roi` is not modified.
     """
     from PIL import Image, ImageDraw
 
@@ -713,7 +783,7 @@ def create_annotation_overlay(roi, annotations, section_index, proteins=None, al
     return np.asarray(Image.alpha_composite(base, layer))[..., :3].copy()
 
 
-def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.35, color_by="protein",
+def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.35, color_by="feature",
                         figsize=(8, 8), ax=None, show=True):
     """Show the original ROI section with the annotation polygons on top and a protein legend.
 
@@ -732,9 +802,10 @@ def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     ax.imshow(sec, extent=(0, W, H, 0), interpolation="nearest")
-    counts = {}
+    counts, legend_rgb = {}, {}
     for rec in recs:
         rgb = tuple(c / 255 for c in _color(rec, color_by))
+        legend_rgb.setdefault(rec["protein"], rgb)
         for rings in _polys(rec["roi_geometry"]):
             verts, codes = [], []
             for ring in rings:
@@ -751,8 +822,7 @@ def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.
         title += f" (Atlas SE {annotations.atlas_sections.get(section_index)})"
     ax.set_title(title + ("" if recs else " - no annotations in this ROI"), fontsize=11)
     if counts:
-        ax.legend(handles=[Patch(facecolor=tuple(c / 255 for c in _hex_rgb(_COLORS[p])) + (alpha,),
-                                 edgecolor=_COLORS[p], label=f"{p} - {STROKE_PROTEINS[p]} ({n})")
+        ax.legend(handles=[Patch(facecolor=legend_rgb[p] + (alpha,), edgecolor=legend_rgb[p], label=f"{p} - {STROKE_PROTEINS[p]} ({n})")
                            for p, n in counts.items()],
                   loc="upper left", bbox_to_anchor=(0, -0.01), fontsize=8, frameon=False)
     if fig is not None:
