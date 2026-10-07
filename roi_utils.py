@@ -762,7 +762,10 @@ def resolve_atlas_sections(stack_indices, biosample_id=None, stain=None, center_
         lists = [v for v in data.values() if isinstance(v, list)]
         data = data["sections"] if isinstance(data.get("sections"), list) else (lists[0] if len(lists) == 1 else None)
     if not isinstance(data, list) or not data:
-        raise RuntimeError(f"Unexpected or empty /sections response from {url}.")
+        raise RuntimeError(f"Unexpected or empty /sections response from {r.url} "
+                           f"(the endpoint has no sections for biosample_id={biosample_id}, stain={stain}; "
+                           f"the Atlas biosample/stain may differ from the annotation biosample, "
+                           f"or pass first_section/atlas section numbers explicitly).")
     nums = np.array([_section_number(rec, section_field) for rec in data])  # API order is kept
 
     if first_section is not None:
