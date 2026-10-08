@@ -41,6 +41,7 @@ __all__ = [
     "load_roi",
     "load_and_preview_roi",
     "get_sgbc_roi_id",
+    "get_roi_drive_id",
     "preview_sections",
     "get_sections",
     "roi_info",
@@ -690,6 +691,78 @@ def find_section_anomalies(roi, size=64, z_thr=5.0, min_change=0.02, skip_ratio=
     order = hit[np.argsort(-(both[hit] - d2[hit]))]
     return {"section": order + 1, "d_prev": prev_[order], "d_next": next_[order], "d_skip": d2[order],
             "score": both[order] - d2[order]}
+
+
+# --------------------------------------------------------------------------- #
+# Drive-id resolver
+# --------------------------------------------------------------------------- #
+# Same ROI Extractor host resolve_atlas_sections() talks to (see ATLAS_SECTIONS_URL below). Override with
+# the ROI_EXTRACTOR_BASE_URL env var, or get_roi_drive_id's own api_url=, for a different deployment.
+ROI_EXTRACTOR_BASE_URL = os.environ.get("ROI_EXTRACTOR_BASE_URL", "http://172.20.23.183:8054")
+
+
+def _canonical_xyz(x, y, section_number, plane):
+    """(x, y, section_number) in this plane's own display terms -> the canonical (axial-space) (x, y, z)
+    the ROI Extractor UI's ?x=&y=&z= deep link expects -- the exact inverse of its own
+    permuteAxialCenterOntoPlane (see static/index.html).
+    """
+    plane = (plane or "axial").lower()
+    if plane == "coronal":
+        return x, section_number, y
+    if plane == "sagittal":
+        return section_number, x, y
+    return x, y, section_number  # axial
+
+
+def get_roi_drive_id(biosample_id, section_number, x, y, z, size, mode="histology", stain="ALL",
+                     resolution="full", plane="axial", api_url=None, verbose=True):
+    """Get the Google Drive id of an ROI that was already exported, without extracting or uploading
+    anything new.
+
+    Parameters are the same ROI identity /extract_roi uses (biosample_id, section_number, x, y, z
+    [z-depth radius], size, mode, stain, resolution, plane). Looks the ROI up by its exact export
+    filename via the backend's read-only /roi_drive_lookup:
+
+        found      -> prints/returns the existing drive_id (use it with load_and_preview_roi, or
+                      download + load_roi(path, mmap=False) yourself).
+        not found  -> extracts/uploads NOTHING. Prints/returns a ROI Extractor UI URL you can open to
+                      generate it (click "Open in Colab", or Extract then Download to Drive) --
+                      then call this again, or paste the drive_id it gives you.
+
+    api_url overrides the ROI Extractor host (default: ROI_EXTRACTOR_BASE_URL env var).
+    """
+    import requests
+    from urllib.parse import urlencode
+
+    base = (api_url or ROI_EXTRACTOR_BASE_URL).rstrip("/")
+    params = {
+        "biosample_id": biosample_id, "section_number": section_number, "x": x, "y": y, "z": z,
+        "size": size, "mode": mode, "stain": stain, "resolution": resolution, "plane": plane,
+    }
+    try:
+        r = requests.get(f"{base}/roi_drive_lookup", params=params, timeout=15)
+        r.raise_for_status()
+        result = r.json()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Could not reach the ROI Extractor at {base}: {e}") from None
+
+    if result.get("exists"):
+        drive_id = result["drive_id"]
+        if verbose:
+            print(f"✅ Found in Drive: {result.get('filename')}")
+            print(f"Drive ID: {drive_id}")
+        return drive_id
+
+    cx, cy, cz = _canonical_xyz(x, y, section_number, plane)
+    ui_url = f"{base}/ui/index.html?" + urlencode({
+        "x": cx, "y": cy, "z": cz, "size": size, "zdepth": z,
+        "mode": mode, "plane": plane, "biosample_id": biosample_id, "stain": stain, "resolution": resolution,
+    })
+    if verbose:
+        print("Not found in Drive yet -- nothing was extracted or uploaded.")
+        print("Open this ROI Extractor URL to generate it, then use its Drive ID:")
+        print(ui_url)
+    return ui_url
 
 
 # --------------------------------------------------------------------------- #

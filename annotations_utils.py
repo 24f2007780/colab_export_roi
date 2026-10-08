@@ -82,9 +82,15 @@ __all__ = [
     "load_roi_annotations",
     "find_stack_index",
     "annotation_bounds",
+    "compute_annotation_properties",
+    "annotation_density_by_section",
+    "compute_annotation_overlap",
+    "filter_annotations",
     "create_annotation_masks",
+    "create_stack_annotation_masks",
     "create_annotation_overlay",
     "preview_annotations",
+    "validate_roi_annotations",
 ]
 
 STROKE_API_BASE = "https://c-stroke.humanbrain.in/histology_detections/openAtlasJson"
@@ -150,7 +156,7 @@ def stroke_biosample_id(biosample_id):
     return ATLAS_BIOSAMPLE_MAP.get(b, b)
 
 
-def stroke_url(biosample_id, stain, section_num, protein, api_base=STROKE_API_BASE):
+def _stroke_url(biosample_id, stain, section_num, protein, api_base=STROKE_API_BASE):
     """URL of one annotation file (the protein is percent-encoded, e.g. 'H&E' -> 'H%26E')."""
     return (f"{api_base.rstrip('/')}/{quote(protein, safe='')}/{biosample_id}/{stain}/{section_num}/"
             f"B-{biosample_id}_SE-{section_num}_registered.json")
@@ -158,7 +164,7 @@ def stroke_url(biosample_id, stain, section_num, protein, api_base=STROKE_API_BA
 
 def _probe_protein(session, biosample_id, stain, section_num, protein, api_base, timeout):
     """-> (url, probe result) for one protein; the STROKE_PROTEINS key is the exact (case-sensitive) URL spelling."""
-    url = stroke_url(biosample_id, stain, section_num, protein, api_base)
+    url = _stroke_url(biosample_id, stain, section_num, protein, api_base)
     return url, _probe(session, url, timeout)
 
 
@@ -352,12 +358,28 @@ class RoiTransform:
     offset_y: float = DEFAULT_OFFSET_XY[1]
 
     def apply(self, xy):
-        """(N, 2) registered coordinates -> (N, 2) ROI (col, row) coordinates, as a new array."""
+        """(N, 2) or (2,) registered coordinates -> (N, 2) or (2,) ROI (col, row) coordinates, as a new array."""
         a = np.asarray(xy, dtype=float)
-        out = np.empty_like(a[:, :2])
-        out[:, 0] = (a[:, 0] - self.offset_x) / self.units_per_px - self.x0
-        out[:, 1] = (self.y_sign * a[:, 1] - self.offset_y) / self.units_per_px - self.y0
-        return out
+        is_1d = (a.ndim == 1)
+        pts = a[None, :2] if is_1d else a[:, :2]
+        out = np.empty_like(pts)
+        out[:, 0] = (pts[:, 0] - self.offset_x) / self.units_per_px - self.x0
+        out[:, 1] = (self.y_sign * pts[:, 1] - self.offset_y) / self.units_per_px - self.y0
+        return out[0] if is_1d else out
+
+    def invert(self, col_row):
+        """(N, 2) or (2,) ROI (col, row) coordinates -> (N, 2) or (2,) registered (X, Y) coordinates, as a new array.
+
+        X = (col + x0) * units_per_px + offset_x
+        Y = ((row + y0) * units_per_px + offset_y) / y_sign
+        """
+        a = np.asarray(col_row, dtype=float)
+        is_1d = (a.ndim == 1)
+        pts = a[None, :2] if is_1d else a[:, :2]
+        out = np.empty_like(pts)
+        out[:, 0] = (pts[:, 0] + self.x0) * self.units_per_px + self.offset_x
+        out[:, 1] = ((pts[:, 1] + self.y0) * self.units_per_px + self.offset_y) / self.y_sign
+        return out[0] if is_1d else out
 
     def describe(self):
         return (f"ROI {self.width}x{self.height}px, origin (level px) = ({self.x0:g}, {self.y0:g}), "
@@ -660,6 +682,8 @@ def load_roi_annotations(roi, meta, biosample_id=None, proteins=None, api_base=S
                 continue
             recs = _records_from_collection(colls[r["url"]], r["protein"], r["url"], biosample_id, stain,
                                             atlas[i])
+            for rec in recs:
+                rec["stack_index"] = i
             n_total += len(recs)
             per[r["protein"]] = to_roi_coordinates(recs, roi, transform=T)
             n_hit += len(per[r["protein"]])
@@ -704,6 +728,26 @@ def _color(rec, color_by):
     return _hex_rgb(_COLORS[rec["protein"]])
 
 
+def _flatten(container, section_index=None):
+    """Any supported annotation container -> flat list of records (shared by the stats/filter/QC functions below).
+
+    Accepts a RoiAnnotations, {protein: [records]}, {stack_index: {protein: [records]}}, a single record dict,
+    a list/tuple of records, or one bare record. `section_index`, if given, narrows a RoiAnnotations (or a plain
+    dict keyed by stack index) to that section; it is ignored by the other shapes, which are already one section.
+    """
+    if isinstance(container, RoiAnnotations):
+        return container.records(section_index=section_index)
+    if isinstance(container, dict):
+        if "geometry" in container or "roi_geometry" in container or "coordinates" in container:
+            return [container]                                   # single record
+        if section_index is not None and section_index in container:
+            container = container[section_index]                 # {stack_index: {...}} -> that section
+        return [r for v in container.values() if isinstance(v, list) for r in v]
+    if isinstance(container, (list, tuple)):
+        return list(container)
+    return [container]
+
+
 def _records_for(annotations, section_index, proteins):
     want = None if proteins is None else _check_proteins(proteins)
     if isinstance(annotations, dict):
@@ -742,20 +786,74 @@ def _section_rgb(roi, section_index):
     return np.clip(a, 0, 255).astype(np.uint8)
 
 
+def _draw_polygons(draw, geom, fill=1, hole_fill=0):
+    """Draw a GeoJSON Polygon/MultiPolygon's rings (exterior filled, holes punched out) onto a PIL ImageDraw."""
+    for rings in _polys(geom):
+        draw.polygon([tuple(p) for p in rings[0]], fill=fill)
+        for hole in rings[1:]:
+            draw.polygon([tuple(p) for p in hole], fill=hole_fill)
+
+
 def create_annotation_masks(roi, annotations, section_index, proteins=None):
     """{protein: bool (H, W) mask} for one stack section. New arrays; `roi` is only used for its H, W."""
     from PIL import Image, ImageDraw
 
     H, W = roi.shape[1], roi.shape[2]
-    masks = {}
+    images = {}
     for rec in _records_for(annotations, section_index, proteins):
-        im = masks.setdefault(rec["protein"], Image.new("L", (W, H), 0))
-        d = ImageDraw.Draw(im)
-        for rings in _polys(rec["roi_geometry"]):
-            d.polygon([tuple(p) for p in rings[0]], fill=1)
-            for hole in rings[1:]:
-                d.polygon([tuple(p) for p in hole], fill=0)
-    return {p: np.asarray(im, dtype=bool) for p, im in masks.items()}
+        im = images.setdefault(rec["protein"], Image.new("L", (W, H), 0))
+        _draw_polygons(ImageDraw.Draw(im), rec["roi_geometry"])
+    return {p: np.asarray(im, dtype=bool) for p, im in images.items()}
+
+
+def create_stack_annotation_masks(roi, roi_annotations, proteins=None):
+    """Generate 3D (Z, H, W) boolean masks for each protein across the whole ROI stack.
+
+    Reuses `create_annotation_masks` for each section to avoid duplicating rasterization logic.
+
+    Parameters:
+      roi              NumPy ROI stack of shape (Z, H, W[, C]).
+      roi_annotations  RoiAnnotations instance (or dict {stack_index: {protein: [records]}}).
+      proteins         subset of proteins (e.g. ['GFAP', 'FIB']); default: all proteins present.
+
+    Returns:
+      {protein: bool array of shape (Z, H, W)}
+    """
+    if roi.ndim < 3:
+        raise ValueError("roi must be a 3D or 4D stack (Z, H, W[, C])")
+    Z, H, W = roi.shape[:3]
+    plist = _check_proteins(proteins) if proteins is not None else None
+
+    # Discover all proteins present in roi_annotations if not specified
+    if plist is None:
+        found_proteins = []
+        if isinstance(roi_annotations, RoiAnnotations):
+            for rec in roi_annotations.records():
+                p = rec.get("protein")
+                if p and p not in found_proteins:
+                    found_proteins.append(p)
+        elif isinstance(roi_annotations, dict):
+            for s_idx, p_dict in roi_annotations.items():
+                if isinstance(p_dict, dict):
+                    for p in p_dict.keys():
+                        if p not in found_proteins:
+                            found_proteins.append(p)
+        plist = _check_proteins(found_proteins) if found_proteins else list(STROKE_PROTEINS)
+
+    # Initialize (Z, H, W) boolean masks
+    stack_masks = {p: np.zeros((Z, H, W), dtype=bool) for p in plist}
+
+    # Populate section by section using existing create_annotation_masks
+    sections = sorted(roi_annotations.keys()) if isinstance(roi_annotations, dict) else range(Z)
+    for z in sections:
+        if not (0 <= z < Z):
+            continue
+        sec_masks = create_annotation_masks(roi, roi_annotations, section_index=z, proteins=plist)
+        for p, m2d in sec_masks.items():
+            if p in stack_masks:
+                stack_masks[p][z] = m2d
+
+    return stack_masks
 
 
 def create_annotation_overlay(roi, annotations, section_index, proteins=None, alpha=0.4, outline=True,
@@ -789,7 +887,9 @@ def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.
 
     annotations   RoiAnnotations from load_roi_annotations, or records already in ROI coordinates
                   (to_roi_coordinates). proteins=["GFAP", "CD68"] shows only those. `roi` is not modified.
-    Returns the matplotlib Figure.
+    Returns the matplotlib Figure for further editing/saving, or None if it was already shown
+    (show=True and no `ax` was passed) - returning an already-shown figure would make Jupyter
+    display it a second time as the cell's result.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import PathPatch, Patch
@@ -829,4 +929,480 @@ def preview_annotations(roi, annotations, section_index, proteins=None, alpha=0.
         fig.tight_layout()
         if show:
             plt.show()
+            return None
     return fig if fig is not None else ax.figure
+
+
+# --------------------------------------------------------------------------- #
+# 6. Annotation statistics / properties
+# --------------------------------------------------------------------------- #
+def _extract_shape(geom_or_rec):
+    """Extract a valid Shapely geometry from a record dict, GeoJSON dict, or existing shape."""
+    if geom_or_rec is None:
+        return None
+    if hasattr(geom_or_rec, "geom_type"):
+        return _make_valid(geom_or_rec) if not geom_or_rec.is_valid else geom_or_rec
+    if isinstance(geom_or_rec, dict):
+        g = geom_or_rec.get("roi_geometry") or geom_or_rec.get("geometry") or geom_or_rec
+        if isinstance(g, dict) and "coordinates" in g and "type" in g:
+            from shapely.geometry import shape as to_shape
+            try:
+                poly = to_shape(g)
+                return _make_valid(poly) if not poly.is_valid else poly
+            except Exception:
+                return None
+    return None
+
+
+def _single_annotation_properties(item, scale=1.0, tissue_area=None):
+    poly = _extract_shape(item)
+    if poly is None or poly.is_empty:
+        base = {
+            "area": 0.0,
+            "perimeter": 0.0,
+            "circularity": 0.0,
+            "aspect_ratio": np.nan,
+            "major_axis": 0.0,
+            "minor_axis": 0.0,
+            "orientation": 0.0,
+            "max_width": 0.0,
+            "tissue_coverage": 0.0 if tissue_area is not None else None,
+            "centroid": None,
+            "bbox": None,
+        }
+    else:
+        raw_area = float(poly.area)
+        raw_length = float(poly.length)
+        area = raw_area * (scale ** 2)
+        perimeter = raw_length * scale
+
+        # Circularity: 4*pi*area / perimeter^2 in [0, 1]
+        circularity = (float(min(1.0, max(0.0, 4.0 * np.pi * raw_area / (raw_length ** 2))))
+                       if raw_length > 0 and raw_area > 0 else 0.0)
+
+        # Minimum rotated rectangle for axes, aspect ratio, orientation
+        mrr = poly.minimum_rotated_rectangle
+        if mrr.geom_type == "Polygon":
+            coords = list(mrr.exterior.coords)
+            lens = [float(np.hypot(coords[i + 1][0] - coords[i][0], coords[i + 1][1] - coords[i][1]))
+                    for i in range(2)]
+            i_long = int(np.argmax(lens))
+            raw_major = lens[i_long]
+            raw_minor = lens[1 - i_long]
+            aspect_ratio = float(raw_major / raw_minor) if raw_minor > 0 else np.nan
+
+            p1, p2 = coords[i_long], coords[i_long + 1]
+            if p1[0] > p2[0]:
+                p1, p2 = p2, p1
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            orientation = float(np.arctan2(dy, dx) * 180.0 / np.pi) if (dx != 0 or dy != 0) else 0.0
+        else:
+            raw_major = raw_minor = 0.0
+            aspect_ratio = np.nan
+            orientation = 0.0
+
+        major_axis = raw_major * scale
+        minor_axis = raw_minor * scale
+
+        # Maximum width (inscribed circle diameter)
+        try:
+            import shapely
+            mic = shapely.maximum_inscribed_circle(poly)
+            raw_max_width = float(2.0 * mic.length)
+        except Exception:
+            raw_max_width = float(2.0 * poly.boundary.distance(poly.representative_point()))
+        max_width = raw_max_width * scale
+
+        tissue_coverage = (float(raw_area / tissue_area) if tissue_area is not None and tissue_area > 0 else None)
+        centroid = (float(poly.centroid.x) * scale, float(poly.centroid.y) * scale)
+        bbox = tuple(float(b) * scale for b in poly.bounds)
+
+        base = {
+            "area": area,
+            "perimeter": perimeter,
+            "circularity": circularity,
+            "aspect_ratio": aspect_ratio,
+            "major_axis": major_axis,
+            "minor_axis": minor_axis,
+            "orientation": orientation,
+            "max_width": max_width,
+            "tissue_coverage": tissue_coverage,
+            "centroid": centroid,
+            "bbox": bbox,
+        }
+
+    if isinstance(item, dict):
+        meta_prefix = {}
+        for k in ("protein", "section", "feature_index", "feature_id", "stack_index"):
+            if k in item:
+                meta_prefix[k] = item[k]
+        props_data = (item.get("properties") or {}).get("data") if isinstance(item.get("properties"), dict) else None
+        if isinstance(props_data, dict):
+            if "name" in props_data:
+                meta_prefix["class_name"] = props_data["name"]
+            if "acronym" in props_data:
+                meta_prefix["acronym"] = props_data["acronym"]
+        return {**meta_prefix, **base}
+    return base
+
+
+def compute_annotation_properties(records, roi=None, section_index=None, units="roi_px", mpp=None):
+    """Calculate basic geometry and morphology properties for Stroke annotation records.
+
+    Properties computed per annotation:
+      * area             polygon area (in units^2)
+      * perimeter        boundary length (in units)
+      * circularity      isoperimetric quotient 4*pi*area/perimeter^2 in [0, 1] (1.0 = circle)
+      * aspect_ratio     major_axis / minor_axis of minimum rotated bounding box (>= 1.0)
+      * major_axis       major axis length (in units)
+      * minor_axis       minor axis length (in units)
+      * orientation      major axis angle in [-90, 90] degrees (relative to horizontal axis)
+      * max_width        maximum inscribed circle diameter (thickness) (in units)
+      * tissue_coverage  fraction [0, 1] of section tissue area covered (when `roi` is provided)
+      * centroid         (col, row) position, in `units` like everything else above
+      * bbox             (min_col, min_row, max_col, max_row) bounding box, in `units`
+
+    Parameters:
+      records            list of record dicts, a single record dict, or a RoiAnnotations instance.
+                         Uses 'roi_geometry' if present, falling back to 'geometry'.
+      roi                NumPy ROI stack (Z, H, W[, C]) or single section (H, W[, C]). If provided,
+                         tissue coverage is computed via roi_utils.tissue_mask.
+      section_index      stack index in `roi` to evaluate tissue area on; if None, inferred from
+                         record['stack_index'] or the center of `roi`.
+      units              'roi_px' (default, level pixels), 'um' (microns), or 'mm' (millimeters).
+      mpp                microns per pixel; required when units='um' or 'mm'.
+
+    Returns:
+      A list of property dicts (or a single dict if a single record was passed). Wrap with
+      `pandas.DataFrame(...)` for tabular analysis.
+    """
+    if units == "roi_px":
+        scale = 1.0
+    elif units == "um":
+        if mpp is None:
+            raise ValueError("units='um' requires 'mpp' (microns per pixel) to be specified.")
+        scale = float(mpp)
+    elif units == "mm":
+        if mpp is None:
+            raise ValueError("units='mm' requires 'mpp' (microns per pixel) to be specified.")
+        scale = float(mpp) / 1000.0
+    else:
+        raise ValueError(f"Unknown units {units!r}. Supported: 'roi_px', 'um', 'mm'.")
+
+    # Helper to fetch and cache tissue area per section index
+    tissue_cache = {}
+
+    def _get_tissue_area(s_idx):
+        if roi is None:
+            return None
+        cache_key = s_idx if s_idx is not None else -1
+        if cache_key in tissue_cache:
+            return tissue_cache[cache_key]
+        from roi_utils import tissue_mask
+        if roi.ndim == 2 or (roi.ndim == 3 and roi.shape[-1] <= 4):
+            sec = roi
+        elif s_idx is not None and 0 <= s_idx < roi.shape[0]:
+            sec = roi[s_idx]
+        elif section_index is not None and 0 <= section_index < roi.shape[0]:
+            sec = roi[section_index]
+        else:
+            sec = roi[len(roi) // 2]
+        t_mask = tissue_mask(sec)
+        t_area = float(np.count_nonzero(t_mask))
+        tissue_cache[cache_key] = t_area
+        return t_area
+
+    # Unpack records container (a single record stays a single record in, single dict out)
+    single_record = isinstance(records, dict) and not isinstance(records, RoiAnnotations) and (
+        "roi_geometry" in records or "geometry" in records or "coordinates" in records
+    ) or not isinstance(records, (RoiAnnotations, dict, list, tuple))
+    flat_records = _flatten(records, section_index=section_index)
+
+    results = []
+    for item in flat_records:
+        s_idx = item.get("stack_index") if isinstance(item, dict) else section_index
+        t_area = _get_tissue_area(s_idx if s_idx is not None else section_index)
+        results.append(_single_annotation_properties(item, scale=scale, tissue_area=t_area))
+
+    return results[0] if single_record else results
+
+
+def annotation_density_by_section(roi_annotations, proteins=None, units="roi_px", mpp=None):
+    """Total annotated area per section per protein, to compare pathology burden across sections.
+
+    The one section-level aggregate missing from compute_annotation_properties, which reports per-annotation
+    (per-polygon) morphology only. Use this to compare, e.g., total CD68+ area on sections that fall inside
+    an MRI lesion's section range (see mri_utils.map_voxel_to_histology_section) against sections outside it.
+
+    roi_annotations  a RoiAnnotations (e.g. from load_roi_annotations) covering every section to compare.
+    proteins         subset of STROKE_PROTEINS to include (default: all proteins present).
+    units, mpp       passed to compute_annotation_properties ('roi_px' default, or 'um'/'mm' with mpp set).
+
+    Returns a list of dicts, one per (stack_index, section, protein): total_area, n_annotations. Wrap with
+    pandas.DataFrame(...) for tabular analysis, the same convention compute_annotation_properties uses.
+    """
+    props = compute_annotation_properties(roi_annotations, units=units, mpp=mpp)
+    want = _check_proteins(proteins) if proteins is not None else None
+
+    totals = {}
+    for p in props:
+        protein = p.get("protein")
+        if want is not None and protein not in want:
+            continue
+        key = (p.get("stack_index"), p.get("section"), protein)
+        agg = totals.setdefault(key, {"total_area": 0.0, "n_annotations": 0})
+        agg["total_area"] += p["area"]
+        agg["n_annotations"] += 1
+
+    rows = [{"stack_index": k[0], "section": k[1], "protein": k[2], **v} for k, v in totals.items()]
+    rows.sort(key=lambda r: (r["stack_index"] if r["stack_index"] is not None else -1, str(r["protein"])))
+    for r in rows:
+        r["total_area"] = round(r["total_area"], 3)
+    return rows
+
+
+def compute_annotation_overlap(records_a, records_b, mode="dice"):
+    """Compute spatial overlap between two sets of annotations (or shapes).
+
+    Modes supported:
+      * 'dice'               Sørensen-Dice coefficient: 2 * |A ∩ B| / (|A| + |B|) in [0, 1]
+      * 'iou'                Intersection over Union: |A ∩ B| / |A ∪ B| in [0, 1]
+      * 'intersection_area'  Area of the geometric intersection |A ∩ B|
+
+    Parameters:
+      records_a, records_b   list of records, a single record dict, a RoiAnnotations instance,
+                             a GeoJSON geometry, or a Shapely geometry object.
+      mode                   'dice' (default), 'iou', or 'intersection_area'.
+
+    Returns:
+      float: the computed overlap value according to `mode`.
+    """
+    def _to_unified_shape(item):
+        if item is None:
+            return None
+        recs = _flatten(item)
+        shapes = []
+        for r in recs:
+            s = _extract_shape(r)
+            if s is not None and not s.is_empty and s.area > 0:
+                shapes.append(s)
+
+        if not shapes:
+            return None
+        if len(shapes) == 1:
+            return shapes[0]
+        import shapely.ops
+        return shapely.ops.unary_union(shapes)
+
+    shape_a = _to_unified_shape(records_a)
+    shape_b = _to_unified_shape(records_b)
+
+    if shape_a is None or shape_b is None or shape_a.is_empty or shape_b.is_empty:
+        return 0.0
+
+    area_a = float(shape_a.area)
+    area_b = float(shape_b.area)
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+
+    inter = shape_a.intersection(shape_b)
+    inter_area = float(inter.area) if not inter.is_empty else 0.0
+
+    m = str(mode).lower()
+    if m == "dice":
+        denom = area_a + area_b
+        return float(2.0 * inter_area / denom) if denom > 0 else 0.0
+    elif m == "iou":
+        denom = area_a + area_b - inter_area
+        return float(inter_area / denom) if denom > 0 else 0.0
+    elif m in ("intersection_area", "intersection"):
+        return inter_area
+    else:
+        raise ValueError(f"Unknown mode {mode!r}. Supported: 'dice', 'iou', 'intersection_area'.")
+
+
+def filter_annotations(records, proteins=None, feature_ids=None, acronyms=None, min_area=None):
+    """Filter annotation records by protein, feature ID, acronym, or minimum area.
+
+    Uses the existing Stroke properties['data'] structure and geometry without
+    creating any new class or model.
+
+    Parameters:
+      records        list of record dicts, a single record dict, a {protein: [records]} dict,
+                     or a RoiAnnotations instance.
+      proteins       protein code or list of codes (e.g. 'GFAP', ['GFAP', 'CD68']).
+      feature_ids    feature ID or list of IDs (e.g. 26, [25, 26], '8') matched against
+                     record['feature_id'], properties['data']['id'], or properties['data']['Part_ID'].
+      acronyms       acronym string or list of acronyms (e.g. 'm GFAP+', ['Fib+', 'd GFAP+'])
+                     matched against properties['data']['acronym'].
+      min_area       minimum polygon area threshold (in the geometry's coordinate units).
+
+    Returns:
+      Filtered container of the same type: a new list of records, or a new RoiAnnotations instance.
+    """
+    want_proteins = (None if proteins is None else
+                     {str(p).strip().lower() for p in (proteins if isinstance(proteins, (list, tuple, set)) else [proteins])})
+    want_ids = (None if feature_ids is None else
+                {str(x).strip().lower() for x in (feature_ids if isinstance(feature_ids, (list, tuple, set)) else [feature_ids])})
+    want_acronyms = (None if acronyms is None else
+                     {str(a).strip().lower() for a in (acronyms if isinstance(acronyms, (list, tuple, set)) else [acronyms])})
+
+    def _matches(rec):
+        if not isinstance(rec, dict):
+            return False
+        if want_proteins is not None:
+            p = str(rec.get("protein", "")).strip().lower()
+            if p not in want_proteins:
+                return False
+        props_data = (rec.get("properties") or {}).get("data") if isinstance(rec.get("properties"), dict) else None
+        if want_ids is not None:
+            candidates = set()
+            if isinstance(props_data, dict):
+                if props_data.get("id") is not None:
+                    candidates.add(str(props_data["id"]).strip().lower())
+                if props_data.get("Part_ID") is not None:
+                    candidates.add(str(props_data["Part_ID"]).strip().lower())
+            if not candidates and rec.get("feature_id") is not None:
+                candidates.add(str(rec["feature_id"]).strip().lower())
+            if not candidates.intersection(want_ids):
+                return False
+        if want_acronyms is not None:
+            acr = props_data.get("acronym") if isinstance(props_data, dict) else None
+            if acr is None or str(acr).strip().lower() not in want_acronyms:
+                return False
+        if min_area is not None:
+            poly = _extract_shape(rec)
+            if poly is None or poly.area < float(min_area):
+                return False
+        return True
+
+    if isinstance(records, RoiAnnotations):
+        out = RoiAnnotations()
+        out.atlas_sections = records.atlas_sections
+        out.availability = records.availability
+        out.transform = records.transform
+        out.biosample_id = records.biosample_id
+        out.stain = records.stain
+        for i, per_protein in records.items():
+            new_per = {}
+            for p, rlist in per_protein.items():
+                matched = [r for r in rlist if _matches(r)]
+                if matched:
+                    new_per[p] = matched
+            out[i] = new_per
+        return out
+    elif isinstance(records, dict) and not ("roi_geometry" in records or "geometry" in records or "coordinates" in records):
+        out_dict = {}
+        for p, rlist in records.items():
+            if isinstance(rlist, list):
+                matched = [r for r in rlist if _matches(r)]
+                if matched:
+                    out_dict[p] = matched
+        return out_dict
+    elif isinstance(records, dict):
+        return [records] if _matches(records) else []
+    return [r for r in _flatten(records) if _matches(r)]
+
+
+def validate_roi_annotations(roi, annotations, section_index=None, min_tissue_fraction=0.5,
+                             tissue_mask_arr=None):
+    """Validate that annotation polygons lie on real histology tissue rather than background glass.
+
+    Uses `roi_utils.tissue_mask` to evaluate whether each annotation polygon falls
+    substantially on tissue (tissue_overlap_fraction >= min_tissue_fraction).
+
+    Parameters:
+      roi                   NumPy ROI stack (Z, H, W[, C]) or single section image (H, W[, C]).
+      annotations           RoiAnnotations container, a {protein: [records]} dict, a list of records,
+                            or a single record dict. Coordinates must be in ROI space (roi_geometry).
+      section_index         stack index in `roi` (e.g. 54). If `roi` is a 2D/single section, this is optional.
+      min_tissue_fraction   minimum fraction of annotation area that must fall on tissue (default 0.5 = 50%).
+      tissue_mask_arr       optional precomputed boolean (H, W) tissue mask. If None, computed via
+                            roi_utils.tissue_mask(sec).
+
+    Returns:
+      dict with:
+        * 'valid': list of records that pass the tissue fraction threshold
+        * 'flagged': list of records that fall substantially outside real tissue
+        * 'summary': dict with overall validation counts and rates
+        * 'details': list of dicts per record (tissue_fraction, is_valid, pixels, metadata)
+    """
+    from PIL import Image, ImageDraw
+
+    # 1. Determine the 2D section image and tissue mask
+    if tissue_mask_arr is not None:
+        t_mask = np.asarray(tissue_mask_arr, dtype=bool)
+    else:
+        from roi_utils import tissue_mask
+        if roi.ndim == 2 or (roi.ndim == 3 and roi.shape[-1] <= 4):
+            sec = roi
+        elif section_index is not None and 0 <= section_index < roi.shape[0]:
+            sec = roi[section_index]
+        else:
+            raise ValueError("section_index is required when roi is a 3D/4D stack.")
+        t_mask = tissue_mask(sec)
+
+    H, W = t_mask.shape[:2]
+
+    # 2. Extract records for this section
+    recs = _flatten(annotations, section_index=section_index)
+
+    valid_records = []
+    flagged_records = []
+    details = []
+
+    for rec in recs:
+        geom = rec.get("roi_geometry")
+        if geom is None:
+            raise ValueError(f"Record {rec.get('feature_id')} has no 'roi_geometry'. "
+                             "Call to_roi_coordinates first.")
+
+        im = Image.new("L", (W, H), 0)
+        _draw_polygons(ImageDraw.Draw(im), geom)
+
+        m = np.asarray(im, dtype=bool)
+        annot_px = int(np.count_nonzero(m))
+        tissue_px = int(np.count_nonzero(m & t_mask))
+        frac = float(tissue_px / annot_px) if annot_px > 0 else 0.0
+        is_valid = (frac >= float(min_tissue_fraction))
+
+        if is_valid:
+            valid_records.append(rec)
+        else:
+            flagged_records.append(rec)
+
+        row = {
+            "protein": rec.get("protein"),
+            "section": rec.get("section"),
+            "feature_id": rec.get("feature_id"),
+            "tissue_fraction": frac,
+            "valid": is_valid,
+            "annotation_pixels": annot_px,
+            "tissue_pixels": tissue_px,
+        }
+        props_data = (rec.get("properties") or {}).get("data") if isinstance(rec.get("properties"), dict) else None
+        if isinstance(props_data, dict):
+            if "name" in props_data:
+                row["class_name"] = props_data["name"]
+            if "acronym" in props_data:
+                row["acronym"] = props_data["acronym"]
+        details.append(row)
+
+    summary = {
+        "total": len(recs),
+        "valid_count": len(valid_records),
+        "flagged_count": len(flagged_records),
+        "valid_rate": float(len(valid_records) / len(recs)) if recs else 1.0,
+        "min_tissue_fraction": float(min_tissue_fraction),
+    }
+
+    return {
+        "valid": valid_records,
+        "flagged": flagged_records,
+        "summary": summary,
+        "details": details,
+    }
+
+
+
